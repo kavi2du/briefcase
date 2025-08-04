@@ -2,6 +2,7 @@ import errno
 import subprocess
 import sys
 import webbrowser
+import re
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -37,11 +38,14 @@ class StaticWebMixin:
     def project_path(self, app):
         return self.bundle_path(app) / "www"
 
+    def static_path(self, app):
+        return self.project_path(app) / "static"
+
     def binary_path(self, app):
         return self.bundle_path(app) / "www/index.html"
 
     def wheel_path(self, app):
-        return self.project_path(app) / "static/wheels"
+        return self.static_path / "wheels"
 
     def distribution_path(self, app):
         return self.dist_path / f"{app.formal_name}-{app.version}.web.zip"
@@ -141,6 +145,101 @@ class StaticWebBuildCommand(StaticWebMixin, BuildCommand):
                         outfilename.parent.mkdir(parents=True, exist_ok=True)
                         with outfilename.open("wb") as f:
                             f.write(content)
+
+    def _merge_insert_content (self, inserts, key, path):
+        """Merge multi-file insert content into a single insert file.
+
+        Rewrites the inserts, removing the entry for ``key``,
+        producing a merged entry for ``path`` that has a single
+        ``key`` insert.
+        This is used to merge multiple contributed CSS files into
+        a single CSS insert.
+
+        :param inserts: All inserts
+        :param key: The key to merge
+        :param path: The path for the merge insert.
+        """
+
+        try:
+            original = inserts.pop(key)
+        except KeyError:
+            #No merging
+            pass
+        else:
+            merged = {}
+            for filename, package_inserts in original.items():
+                for package, css in package_inserts.items():
+                    try:
+                        old_css = merged[package]
+                    except KeyError:
+                        old_css = ""
+
+                    full_css = f"{old_css}/********** {filename} **********/\n{css}\n"
+                    merged[package] = full_css
+
+            # Preserve the merged content as a single insert
+            inserts[path] = {key: merged}
+
+    def _write_inserts(self, app: AppConfig, filename: Path, inserts: dict):
+        """Write inserts into an existing file.
+
+        This function looks for start and end markers in the named file and
+        replaces the content inside the markers with the inserted content.
+
+        Multiple formats of insert marker are inspected to accommodate HTML
+        and CSS/JS comment conventions:
+        * HTML: ``<!--@@ insert:start @@-->`` and ``<!--@@ insert:end @@-->``
+        * CSS/JS: ``/*@@ insert:start @@*/`` and ``/*@@ insert:end @@*/``
+
+        :param app: The application whose ``pyscript.toml`` is being written.
+        :param filename: The file whose insert is to be written.
+        :param inserts: The inserts for the file. A 2 level dictionary, keyed by
+            the name of the insert to add, and then package that contributed the
+            insert.
+        """
+        # Read the current content
+        with (self.project_path(app) / filename).open() as f:
+            content = f.read()
+
+        for insert, packages in inserts.items():
+            for comment, marker, replacement in [
+                # HTML
+                (
+                    (
+                        "<!--------------------------------------------------\n"
+                        " * {package}\n"
+                        " -------------------------------------------------->\n"
+                        "{content}"
+                    ),
+                    r"<!--@@ {insert}:start @@-->.*?<!--@@ {insert}:end @@-->",
+                    r"<!--@@ {insert}:start @@-->\n{content}<!--@@ {insert}:end @@-->",
+                ),
+                # CSS/JS
+                (
+                    (
+                        "/**************************************************\n"
+                        " * {package}\n"
+                        " *************************************************/\n"
+                        "{content}"
+                    ),
+                    r"/\*@@ {insert}:start @@\*/.*?/\*@@ {insert}:end @@\*/",
+                    r"/*@@ {insert}:start @@*/\n{content}/*@@ {insert}:end @@*/",
+                ),
+            ]:
+                full_insert = "\n".join(
+                    comment.format(package=package, content=content)
+                    for package, content in packages.items()
+                )
+                content = re.sub(
+                    marker.format(insert=insert),
+                    replacement.format(insert=insert, content=full_insert),
+                    content,
+                    flags=re.MULTILINE | re.DOTALL,
+                )
+
+        # Write the new index.html
+        with (self.project_path(app) / filename).open("w") as f:
+            f.write(content)
 
     def build_app(self, app: AppConfig, **kwargs):
         """Build the static web deployment for the application.
