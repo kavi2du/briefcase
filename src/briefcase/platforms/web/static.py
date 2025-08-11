@@ -1,14 +1,19 @@
 import errno
+import re
 import subprocess
 import sys
 import webbrowser
-import re
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from zipfile import ZipFile
 
 from briefcase.console import Console
+from briefcase.exceptions import (
+    BriefcaseCommandError,
+    BriefcaseConfigError,
+    UnsupportedCommandError,
+)
 
 if sys.version_info >= (3, 11):  # pragma: no-cover-if-lt-py311
     import tomllib
@@ -20,6 +25,7 @@ import tomli_w
 from briefcase.commands import (
     BuildCommand,
     CreateCommand,
+    DevCommand,
     OpenCommand,
     PackageCommand,
     PublishCommand,
@@ -27,7 +33,6 @@ from briefcase.commands import (
     UpdateCommand,
 )
 from briefcase.config import AppConfig
-from briefcase.exceptions import BriefcaseCommandError, BriefcaseConfigError
 
 
 class StaticWebMixin:
@@ -38,14 +43,14 @@ class StaticWebMixin:
     def project_path(self, app):
         return self.bundle_path(app) / "www"
 
-    def static_path(self, app):
-        return self.project_path(app) / "static"
-
     def binary_path(self, app):
         return self.bundle_path(app) / "www/index.html"
 
+    def static_path(self, app):
+        return self.project_path(app) / "static"
+
     def wheel_path(self, app):
-        return self.static_path / "wheels"
+        return self.static_path(app) / "wheels"
 
     def distribution_path(self, app):
         return self.dist_path / f"{app.formal_name}-{app.version}.web.zip"
@@ -95,58 +100,7 @@ class StaticWebBuildCommand(StaticWebMixin, BuildCommand):
             for line in content:
                 f.write(line)
 
-    def _process_wheel(self, wheelfile, static_path):
-        """Process a wheel, extracting any content that needs to be compiled into the
-        final project.
-
-        Extracted content is received in two forms:
-        * inserts - html content to be inserted into existing html files.
-        * static - content to be copied as a whole. Content in a ``static``
-            folder inside the wheel is copied as-is to the static folder,
-            namespaced by the package name of the wheel.
-
-        Any pre-existing static content for the wheel will be deleted.
-
-        :param wheelfile: The path to the wheel file to be processed.
-        :param inserts: The insert collection of html for the app
-        :param static_path: The location where static content should be unpacked
-        """
-        parts = wheelfile.name.split("-")
-        package_name = parts[0]
-        package_version = parts[1]
-        package_key = f"{package_name} {package_version}"
-
-        if (static_path / package_name).exists():
-            self.tools.shutil.rmtree(static_path / package_name)
-
-        with ZipFile(wheelfile) as wheel:
-            for filename in wheel.namelist():
-                path = Path(filename)
-                if len(path.parts) > 1:
-                    if path.parts[1] == "inserts":
-                        source = str(Path(*path.parts[2:]))
-                        content = wheel.read(filename).decode("utf-8")
-                        if ":" in path.name:
-                            target, insert = source.split(":")
-                            self.logger.info(
-                                f"  {source}: Adding {insert} insert for {target}"
-                            )
-                        else:
-                            target = path.suffix[1:].upper()
-                            insert = source
-                            self.logger.info(f"    {source}: Adding {target} insert")
-
-                        insert.setdefault(target, {}).setdefault(insert, {})[
-                            package_key
-                        ] = content
-                    elif path.parts[1] == "static":
-                        content = wheel.read(filename)
-                        outfilename = static_path / package_name / Path(*path.parts[2:])
-                        outfilename.parent.mkdir(parents=True, exist_ok=True)
-                        with outfilename.open("wb") as f:
-                            f.write(content)
-
-    def _merge_insert_content (self, inserts, key, path):
+    def _merge_insert_content(self, inserts, key, path):
         """Merge multi-file insert content into a single insert file.
 
         Rewrites the inserts, removing the entry for ``key``,
@@ -163,7 +117,7 @@ class StaticWebBuildCommand(StaticWebMixin, BuildCommand):
         try:
             original = inserts.pop(key)
         except KeyError:
-            #No merging
+            # No merging
             pass
         else:
             merged = {}
@@ -198,48 +152,243 @@ class StaticWebBuildCommand(StaticWebMixin, BuildCommand):
             insert.
         """
         # Read the current content
-        with (self.project_path(app) / filename).open() as f:
-            content = f.read()
+        target_path = self.project_path(app) / filename
+        if not target_path.exists():
+            self.console.warning(f"  Target {filename} not found; skipping inserts.")
+            return
 
-        for insert, packages in inserts.items():
-            for comment, marker, replacement in [
+        with target_path.open("r", encoding="utf-8") as f:
+            file_text = f.read()
+
+        for slot in sorted(inserts.keys()):
+            packages = inserts[slot]
+
+            html_banner = (
+                "<!--------------------------------------------------\n"
+                " * {package}\n"
+                " -------------------------------------------------->\n"
+                "{content}"
+            )
+            css_banner = (
+                "/**************************************************\n"
+                " * {package}\n"
+                " *************************************************/\n"
+                "{content}"
+            )
+
+            marker_styles = [
                 # HTML
                 (
-                    (
-                        "<!--------------------------------------------------\n"
-                        " * {package}\n"
-                        " -------------------------------------------------->\n"
-                        "{content}"
-                    ),
-                    r"<!--@@ {insert}:start @@-->.*?<!--@@ {insert}:end @@-->",
-                    r"<!--@@ {insert}:start @@-->\n{content}<!--@@ {insert}:end @@-->",
+                    r"<!--@@ {slot}:start @@-->.*?<!--@@ {slot}:end @@-->",
+                    r"<!--@@ {slot}:start @@-->\n{content}<!--@@ {slot}:end @@-->",
+                    "html",
                 ),
                 # CSS/JS
                 (
-                    (
-                        "/**************************************************\n"
-                        " * {package}\n"
-                        " *************************************************/\n"
-                        "{content}"
-                    ),
-                    r"/\*@@ {insert}:start @@\*/.*?/\*@@ {insert}:end @@\*/",
-                    r"/*@@ {insert}:start @@*/\n{content}/*@@ {insert}:end @@*/",
+                    r"/\*@@ {slot}:start @@\*/.*?/\*@@ {slot}:end @@\*/",
+                    r"/*@@ {slot}:start @@*/\n{content}/*@@ {slot}:end @@*/",
+                    "css",
                 ),
-            ]:
-                full_insert = "\n".join(
-                    comment.format(package=package, content=content)
-                    for package, content in packages.items()
+            ]
+
+            html_body = "\n".join(
+                html_banner.format(package=pkg, content=packages[pkg])
+                for pkg in sorted(packages.keys())
+            )
+            css_body = "\n".join(
+                css_banner.format(package=pkg, content=packages[pkg])
+                for pkg in sorted(packages.keys())
+            )
+
+            replaced = False
+            for pattern_tmpl, repl_tmpl, kind in marker_styles:
+                pattern = re.compile(
+                    pattern_tmpl.format(slot=slot), flags=re.MULTILINE | re.DOTALL
                 )
-                content = re.sub(
-                    marker.format(insert=insert),
-                    replacement.format(insert=insert, content=full_insert),
-                    content,
-                    flags=re.MULTILINE | re.DOTALL,
+                if pattern.search(file_text):
+                    body = html_body if kind == "html" else css_body
+                    file_text = pattern.sub(
+                        repl_tmpl.format(slot=slot, content=body),
+                        file_text,
+                    )
+                    replaced = True
+                    break
+
+            if not replaced:
+                self.console.warning(
+                    f"  Slot '{slot}' markers not found in {filename}; skipping."
                 )
 
-        # Write the new index.html
-        with (self.project_path(app) / filename).open("w") as f:
-            f.write(content)
+        with target_path.open("w", encoding="utf-8") as f:
+            f.write(file_text)
+
+    def _process_wheel(self, wheelfile, inserts, static_path):
+        """Process a wheel, extracting any content that needs to be compiled into the
+        final project.
+
+        Extracted content comes in two forms:
+        * inserts - pieces of content that will be inserted into existing files
+        * static - content that will be copied wholesale. Any content in a ``static``
+          folder inside the wheel will be copied as-is to the static folder,
+          namespaced by the package name of the wheel.
+
+        Any pre-existing static content for the wheel will be deleted.
+
+        :param wheelfile: The path to the wheel file to be processed.
+        :param inserts: The inserts collection for the app
+        :param static_path: The location where static content should be unpacked
+        """
+        parts = wheelfile.name.split("-")
+        package_name = parts[0]
+        package_version = parts[1]
+        package_key = f"{package_name} {package_version}"
+
+        # Purge any existing extracted static files for this wheel
+        pkg_static_root = static_path / package_name
+        if pkg_static_root.exists():
+            self.tools.shutil.rmtree(pkg_static_root)
+
+        with ZipFile(wheelfile) as wheel:
+            for filename in wheel.namelist():
+                path = Path(filename)
+                if len(path.parts) < 2:
+                    continue
+
+                is_inserts = (path.parts[1] == "inserts") or (
+                    len(path.parts) >= 3
+                    and path.parts[1] == "deploy"
+                    and path.parts[2] == "inserts"
+                )
+                if is_inserts and path.name:
+                    source = (
+                        str(Path(*path.parts[2:]))
+                        if path.parts[1] == "inserts"
+                        else str(Path(*path.parts[3:]))
+                    )
+                    if ":" not in path.name:
+                        self.console.warning(
+                            f"    {source}: missing ':<slot>'; skipping insert."
+                        )
+                        continue
+                    target, slot = source.split(":", 1)
+                    self.console.info(
+                        f"    {source}: Adding {slot} insert for {target}"
+                    )
+                    try:
+                        text = wheel.read(filename).decode("utf-8")
+                    except UnicodeDecodeError:
+                        self.console.warning(
+                            f"    {source}: non-UTF8 insert; skipping."
+                        )
+                        continue
+                    inserts.setdefault(target, {}).setdefault(slot, {})[package_key] = (
+                        text
+                    )
+                    continue
+
+                is_static = (path.parts[1] == "static") or (
+                    len(path.parts) >= 3
+                    and path.parts[1] == "deploy"
+                    and path.parts[2] == "static"
+                )
+                if is_static:
+                    if filename.endswith("/"):
+                        continue
+                    rel_parts = (
+                        path.parts[2:] if path.parts[1] == "static" else path.parts[3:]
+                    )
+                    outfilename = pkg_static_root / Path(*rel_parts)
+                    outfilename.parent.mkdir(parents=True, exist_ok=True)
+                    with outfilename.open("wb") as f:
+                        f.write(wheel.read(filename))
+
+    def _gather_backend_config(self, wheels):
+        """Processes multiple wheels to gather a config.toml and a base pyscript.toml
+        file.
+
+        :param wheels: A list of wheel files to be scanned.
+        """
+        config_counter = 0
+        pyscript_config = None
+
+        for wheelfile in wheels:
+            with ZipFile(wheelfile) as wheel:
+                for filename in wheel.namelist():
+                    path = Path(filename)
+                    if (
+                        len(path.parts) > 1
+                        and path.parts[1] == "deploy"
+                        and path.name == "config.toml"
+                    ):
+                        self.console.info(f"    Found {filename}")
+                        config_counter += 1
+                        # Raise an error if more than one configuration file is supplied.
+                        if config_counter > 1:
+                            raise BriefcaseConfigError(
+                                "Only 1 backend configuration file can be supplied."
+                            )
+                        # Check which backend type is used. Raise error if no backend is present in config.toml
+                        with wheel.open(filename) as config_file:
+                            config_data = tomllib.load(config_file)
+
+                            if "backend" in config_data:
+                                backend = config_data.get("backend")
+
+                                # Currently, only pyscript is supported, will raise an error if another backend is found.
+                                if backend != "pyscript":
+                                    raise BriefcaseConfigError(
+                                        "Only 'pyscript' backend is currently supported for web static builds."
+                                    )
+
+                                pyscript_config = self._gather_backend_config_file(
+                                    wheel, backend, path
+                                )
+
+                            else:
+                                raise BriefcaseConfigError(
+                                    "No backend was provided in config.toml file."
+                                )
+        # Return a blank pyscript config if no configuration file is found.
+        if config_counter == 0 and pyscript_config is None:
+            pyscript_config = {}
+
+        return pyscript_config
+
+    def _gather_backend_config_file(self, wheel, backend, path):
+        """Find backend config file (eg: pyscript.toml) from a wheel and save it to
+        project pyscript.toml if found.
+
+        :param wheel: Wheel file to scan for configuration file.
+        :param backend: The backend type as a String (eg "pyscript")
+        :param path: Path to the wheels configuration file (config.toml). This should be
+            in the same directory as the backend configuration file.
+        """
+        backend_counter = 0
+        backend_config = None
+        deploy_dir = path.parent
+
+        for deploy_file in wheel.namelist():
+            deploy_parent = Path(deploy_file).parent
+            if (
+                deploy_parent == deploy_dir
+                and Path(deploy_file).name == f"{backend}.toml"
+            ):
+                backend_counter += 1
+                # Raise an error if more than one pyscript.toml file is found.
+                if backend_counter > 1:
+                    raise BriefcaseConfigError(
+                        "Only 1 pyscript configuration file can be supplied."
+                    )
+                # Save pyscript config file.
+                else:
+                    try:
+                        with wheel.open(deploy_file) as pyscript_file:
+                            backend_config = tomllib.load(pyscript_file)
+                    except tomllib.TOMLDecodeError as e:
+                        raise BriefcaseConfigError(
+                            f"pyscript.toml content isn't valid TOML: {e}"
+                        ) from e
+        return backend_config
 
     def build_app(self, app: AppConfig, **kwargs):
         """Build the static web deployment for the application.
@@ -305,15 +454,7 @@ class StaticWebBuildCommand(StaticWebMixin, BuildCommand):
         with self.console.wait_bar("Writing Pyscript configuration file..."):
             # Load any pre-existing pyscript.toml provided by the template. If the file
             # doesn't exist, assume an empty pyscript.toml as a starting point.
-            try:
-                with (self.project_path(app) / "pyscript.toml").open("rb") as f:
-                    config = tomllib.load(f)
-            except tomllib.TOMLDecodeError as e:
-                raise BriefcaseConfigError(
-                    f"pyscript.toml content isn't valid TOML: {e}"
-                ) from e
-            except FileNotFoundError:
-                config = {}
+            config = self._gather_backend_config(self.wheel_path(app).glob("*.whl"))
 
             # Add the packages declaration to the existing pyscript.toml.
             # Ensure that we're using Unix path separators, as the content
@@ -348,11 +489,20 @@ class StaticWebBuildCommand(StaticWebMixin, BuildCommand):
                 sentinel=" ******************* Wheel contributed styles **********************/",
             )
 
-            # Extract static resources from packaged wheels
+            inserts: dict[str, dict[str, dict[str, str]]] = {}
+            static_root = self.static_path(app)
+
             for wheelfile in sorted(self.wheel_path(app).glob("*.whl")):
                 self.console.info(f"  Processing {wheelfile.name}...")
-                with briefcase_css_path.open("a", encoding="utf-8") as css_file:
-                    self._process_wheel(wheelfile, css_file=css_file)
+                self._process_wheel(
+                    wheelfile=wheelfile,
+                    inserts=inserts,
+                    static_path=static_root,
+                )
+
+            # Write inserts per target
+            for target in sorted(inserts.keys()):
+                self._write_inserts(app, Path(target), inserts[target])
 
         return {}
 
@@ -569,6 +719,19 @@ class StaticWebPublishCommand(StaticWebMixin, PublishCommand):
     default_publication_channel = "s3"
 
 
+class StaticWebDevCommand(StaticWebMixin, DevCommand):
+    description = "Run a static web project in development mode. (Work in progress)"
+
+    def run_dev_app(self, app: AppConfig, env, passthrough=None, **kwargs):
+        raise UnsupportedCommandError(
+            platform="web",
+            output_format="static",
+            command="dev",
+        )
+
+    # implement logic to run the web server in development mode
+
+
 # Declare the briefcase command bindings
 create = StaticWebCreateCommand
 update = StaticWebUpdateCommand
@@ -577,3 +740,4 @@ build = StaticWebBuildCommand
 run = StaticWebRunCommand
 package = StaticWebPackageCommand
 publish = StaticWebPublishCommand
+dev = StaticWebDevCommand
