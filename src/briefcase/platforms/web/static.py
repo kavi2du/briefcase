@@ -160,8 +160,8 @@ class StaticWebBuildCommand(StaticWebMixin, BuildCommand):
         with target_path.open("r", encoding="utf-8") as f:
             file_text = f.read()
 
-        for slot in sorted(inserts.keys()):
-            packages = inserts[slot]
+        for insert in sorted(inserts.keys()):
+            packages = inserts[insert]
 
             html_banner = (
                 "<!--------------------------------------------------\n"
@@ -179,14 +179,14 @@ class StaticWebBuildCommand(StaticWebMixin, BuildCommand):
             marker_styles = [
                 # HTML
                 (
-                    r"<!--@@ {slot}:start @@-->.*?<!--@@ {slot}:end @@-->",
-                    r"<!--@@ {slot}:start @@-->\n{content}<!--@@ {slot}:end @@-->",
+                    r"<!--@@ {insert}:start @@-->.*?<!--@@ {insert}:end @@-->",
+                    r"<!--@@ {insert}:start @@-->\n{content}<!--@@ {insert}:end @@-->",
                     "html",
                 ),
                 # CSS/JS
                 (
-                    r"/\*@@ {slot}:start @@\*/.*?/\*@@ {slot}:end @@\*/",
-                    r"/*@@ {slot}:start @@*/\n{content}/*@@ {slot}:end @@*/",
+                    r"/\*@@ {insert}:start @@\*/.*?/\*@@ {insert}:end @@\*/",
+                    r"/*@@ {insert}:start @@*/\n{content}/*@@ {insert}:end @@*/",
                     "css",
                 ),
             ]
@@ -203,12 +203,12 @@ class StaticWebBuildCommand(StaticWebMixin, BuildCommand):
             replaced = False
             for pattern_tmpl, repl_tmpl, kind in marker_styles:
                 pattern = re.compile(
-                    pattern_tmpl.format(slot=slot), flags=re.MULTILINE | re.DOTALL
+                    pattern_tmpl.format(nsert=insert), flags=re.MULTILINE | re.DOTALL
                 )
                 if pattern.search(file_text):
                     body = html_body if kind == "html" else css_body
                     file_text = pattern.sub(
-                        repl_tmpl.format(slot=slot, content=body),
+                        repl_tmpl.format(insert=insert, content=body),
                         file_text,
                     )
                     replaced = True
@@ -216,7 +216,7 @@ class StaticWebBuildCommand(StaticWebMixin, BuildCommand):
 
             if not replaced:
                 self.console.warning(
-                    f"  Slot '{slot}' markers not found in {filename}; skipping."
+                    f"  Slot '{insert}' markers not found in {filename}; skipping."
                 )
 
         with target_path.open("w", encoding="utf-8") as f:
@@ -267,12 +267,12 @@ class StaticWebBuildCommand(StaticWebMixin, BuildCommand):
                     )
                     if ":" not in path.name:
                         self.console.warning(
-                            f"    {source}: missing ':<slot>'; skipping insert."
+                            f"    {source}: missing ':<insert>'; skipping insert."
                         )
                         continue
-                    target, slot = source.split(":", 1)
+                    target, insert = source.split(":", 1)
                     self.console.info(
-                        f"    {source}: Adding {slot} insert for {target}"
+                        f"    {source}: Adding {insert} insert for {target}"
                     )
                     try:
                         text = wheel.read(filename).decode("utf-8")
@@ -281,9 +281,9 @@ class StaticWebBuildCommand(StaticWebMixin, BuildCommand):
                             f"    {source}: non-UTF8 insert; skipping."
                         )
                         continue
-                    inserts.setdefault(target, {}).setdefault(slot, {})[package_key] = (
-                        text
-                    )
+                    inserts.setdefault(target, {}).setdefault(insert, {})[
+                        package_key
+                    ] = text
                     continue
 
                 is_static = (path.parts[1] == "static") or (
